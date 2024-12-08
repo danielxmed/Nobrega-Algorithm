@@ -11,8 +11,8 @@ import json
 ############################################################
 
 DATASET_DIR = "dataset"  # diretório raiz do dataset
-TRAIN_DIR = os.path.join(DATASET_DIR, "C:/Users/Daniel/Downloads/Gabriel/dataset/train")
-VAL_DIR = os.path.join(DATASET_DIR, "C:/Users/Daniel/Downloads/Gabriel/dataset/validation")
+TRAIN_DIR = os.path.join(DATASET_DIR, "train")
+VAL_DIR = os.path.join(DATASET_DIR, "validation")
 
 # Critérios de iteração
 INITIAL_TRIALS = 100
@@ -54,11 +54,25 @@ print("Imagens em treinamento:", count_images_in_dir(TRAIN_DIR))
 print("Imagens em validação:", count_images_in_dir(VAL_DIR))
 
 ############################################################
+# FUNÇÕES DE SUPORTE AO PRÉ-PROCESSAMENTO
+############################################################
+
+def simulate_grayscale(x):
+    # x: tensor com shape (batch, height, width, 3)
+    # Converte para grayscale, replicando o canal cinza 3 vezes
+    gray = tf.reduce_mean(x, axis=-1, keepdims=True) # (batch, h, w, 1)
+    gray_3ch = tf.concat([gray, gray, gray], axis=-1) # (batch, h, w, 3)
+    return gray_3ch
+
+############################################################
 # FUNÇÃO DE CRIAÇÃO DO PIPELINE DE DADOS
 ############################################################
 
-def get_datasets(img_size=(224,224), batch_size=32, color_mode='rgb',
+def get_datasets(img_size=(224,224), batch_size=32, use_rgb=True,
                  rotation_factor=0.0, zoom_factor=0.0, horizontal_flip=False, vertical_flip=False, brightness_factor=0.0):
+    
+    # Sempre carregar em RGB para compatibilidade com redes pré-treinadas
+    color_mode = 'rgb'
     
     train_ds = tf.keras.preprocessing.image_dataset_from_directory(
         TRAIN_DIR,
@@ -103,10 +117,14 @@ def get_datasets(img_size=(224,224), batch_size=32, color_mode='rgb',
         if train_augs:
             x = train_augs(x, training=True)
         x = preprocessing(x)
+        if not use_rgb:
+            x = simulate_grayscale(x)
         return x, y
 
     def preprocess_val(x, y):
         x = preprocessing(x)
+        if not use_rgb:
+            x = simulate_grayscale(x)
         return x, y
     
     train_ds = train_ds.map(augment, num_parallel_calls=AUTOTUNE).prefetch(AUTOTUNE)
@@ -120,9 +138,10 @@ def get_datasets(img_size=(224,224), batch_size=32, color_mode='rgb',
 
 def build_model(hp):
     model_type = hp.Choice("model_type", ["custom", "ResNet50", "InceptionV3", "EfficientNetB0", "MobileNetV2", "DenseNet121", "VGG16"])
-    input_shape = (hp.Choice("img_size", [128, 224, 256]),
-                   hp.Choice("img_size", [128, 224, 256]),
-                   3 if hp.Boolean("use_rgb") else 1)
+    # Agora o input_shape sempre terá 3 canais, pois simularemos grayscale internamente se necessário
+    input_size = hp.Choice("img_size", [128, 224, 256])
+    use_rgb = hp.Boolean("use_rgb")
+    input_shape = (input_size, input_size, 3)
     
     inputs = keras.Input(shape=input_shape)
     x = inputs
@@ -207,7 +226,8 @@ def model_builder(hp):
 def run_trial(hp):
     img_size = hp.get("img_size")
     use_rgb = hp.get("use_rgb")
-    color_mode = "rgb" if use_rgb else "grayscale"
+    # Agora sempre color_mode='rgb' no get_datasets
+    # e passamos use_rgb para decidir se simulamos grayscale
     batch_size = hp.Choice("batch_size", [8,16,32,64])
     rotation_factor = hp.Float("rotation", 0.0, 0.15, step=0.05)
     zoom_factor = hp.Float("zoom", 0.0, 0.2, step=0.05)
@@ -218,7 +238,7 @@ def run_trial(hp):
     train_ds, val_ds = get_datasets(
         img_size=(img_size, img_size),
         batch_size=batch_size,
-        color_mode=color_mode,
+        use_rgb=use_rgb,
         rotation_factor=rotation_factor,
         zoom_factor=zoom_factor,
         horizontal_flip=horizontal_flip,
@@ -252,71 +272,49 @@ def adaptive_search(tuner, initial_trials=100, add_trials=50, max_limit=500,
                     stagnation_check=STAGNATION_CHECK_TRIALS,
                     significant_threshold=SIGNIFICANT_IMPROVEMENT_THRESHOLD):
 
-    # Rodar os primeiros 100 trials
     current_max_trials = initial_trials
     tuner.search(max_trials=current_max_trials)
     
     best_scores = get_val_acc_history(tuner)
-    # Função auxiliar para calcular se houve melhora
-    # Retorna True se houve melhora relativa > improvement_threshold nos últimos 'check_len' trials
-    # ou False se estagnou.
+    
     def check_improvement(history, check_len=stagnation_check, threshold=improvement_threshold):
         if len(history) < check_len+1:
-            return True  # Ainda não temos histórico suficiente, presumir que há possibilidade de melhora
+            return True
         recent = history[-check_len:]
         prev = history[-check_len-1]
-        # Verificar a porcentagem de melhora entre prev e o valor médio ou máximo dos recentes
         current_best = max(recent)
         relative_improvement = (current_best - prev) / (prev + 1e-8)
         return relative_improvement > threshold
     
-    # Enquanto estiver melhorando, adiciona mais 50 trials
     while True:
         if check_improvement(best_scores, stagnation_check, improvement_threshold):
-            # Está melhorando, rodar mais 50
             if current_max_trials >= max_limit:
-                # Chegou no limite de 500 trials
-                # Verificar se há melhora significativa nos últimos 50 trials
                 if check_significant_improvement(best_scores, check_len=50, threshold=significant_threshold):
                     current_max_trials += add_trials
-                    if current_max_trials > max_limit + add_trials:  
-                        # Mesmo após a melhora significativa, não vamos continuar indefinidamente
+                    if current_max_trials > max_limit + add_trials:
                         break
                 else:
-                    # Não houve melhora significativa. Parar.
                     break
             else:
                 current_max_trials += add_trials
         else:
-            # Não está melhorando (estagnou por 20 trials)
             break
         
-        # Rodar novamente o tuner com o novo limite
         tuner.search(max_trials=current_max_trials)
         best_scores = get_val_acc_history(tuner)
     
-    # Ao final, temos o melhor conjunto de hiperparâmetros
     best_hp = get_best_hparams_no_overfit(tuner)
     if best_hp is None:
-        # Se não encontrou um conjunto sem overfitting significativo
         best_hp = tuner.get_best_hyperparameters(1)[0]
     return best_hp
 
-
 def get_val_acc_history(tuner):
-    # Obter o histórico da melhor val_accuracy a cada trial concluído
-    trials = tuner.oracle.get_best_trials(num_trials=len(tuner.oracle.trials))
-    val_accs = [t.metrics.get("val_accuracy", 0) for t in tuner.oracle.trials.values()]
-    # Ordenar conforme a ordem em que foram rodados (trial_id)
-    # trial_id em tuner.oracle.trials pode ser string, ordenar pelo tempo de criação
     sorted_trials = sorted(tuner.oracle.trials.values(), key=lambda x: x.start_time)
     return [tr.metrics.get("val_accuracy",0) for tr in sorted_trials if tr.status == "COMPLETED"]
 
 def check_significant_improvement(history, check_len=50, threshold=0.10):
-    # Verifica se houve aumento de pelo menos 10% (ou threshold) nos últimos 50 trials
-    # em relação ao valor no início desses 50 trials
     if len(history) <= check_len:
-        return True  # Se não há 50 trials, considerar que ainda há melhora
+        return True
     recent = history[-check_len:]
     prev = history[-check_len-1]
     current_best = max(recent)
@@ -324,7 +322,6 @@ def check_significant_improvement(history, check_len=50, threshold=0.10):
     return relative_improvement > threshold
 
 def get_best_hparams_no_overfit(tuner):
-    # Selecionar melhores hparams sem overfitting
     best_trials = sorted(tuner.oracle.get_best_trials(num_trials=len(tuner.oracle.trials)),
                          key=lambda t: t.metrics.get("val_accuracy", 0),
                          reverse=True)
@@ -346,6 +343,7 @@ class OverfittingCheckTuner(BayesianOptimization):
         self.oracle.update_trial(trial.trial_id, {'val_accuracy': val_acc, 'train_accuracy': train_acc})
         self.oracle.save()
 
+print("Iniciando a busca Bayesiana de hiperparâmetros com critério adaptativo...")
 tuner = OverfittingCheckTuner(
     hypermodel=model_builder,
     objective="val_accuracy",
@@ -355,9 +353,8 @@ tuner = OverfittingCheckTuner(
     max_trials=INITIAL_TRIALS
 )
 
-print("Iniciando a busca Bayesiana de hiperparâmetros com critério adaptativo...")
-best_hparams = adaptive_search(tuner, initial_trials=INITIAL_TRIALS, 
-                               add_trials=ADDITIONAL_TRIALS, 
+best_hparams = adaptive_search(tuner, initial_trials=INITIAL_TRIALS,
+                               add_trials=ADDITIONAL_TRIALS,
                                max_limit=MAX_TRIALS_LIMIT,
                                improvement_threshold=IMPROVEMENT_THRESHOLD,
                                stagnation_check=STAGNATION_CHECK_TRIALS,
@@ -371,12 +368,12 @@ print("Melhores hiperparâmetros (sem overfitting) ou caso não encontrado, melh
 
 final_hp = best_hparams
 final_img_size = final_hp.get("img_size")
-final_color_mode = "rgb" if final_hp.get("use_rgb") else "grayscale"
+final_use_rgb = final_hp.get("use_rgb")
 final_batch_size = final_hp.get("batch_size")
 train_ds, val_ds = get_datasets(
     img_size=(final_img_size, final_img_size),
     batch_size=final_batch_size,
-    color_mode=final_color_mode,
+    use_rgb=final_use_rgb,
     rotation_factor=final_hp.get("rotation"),
     zoom_factor=final_hp.get("zoom"),
     horizontal_flip=final_hp.get("hflip"),
